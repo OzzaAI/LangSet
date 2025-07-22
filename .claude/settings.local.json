@@ -22,7 +22,8 @@
       "Bash(./node_modules/.bin/next dev)",
       "WebFetch(domain:docs.microsoft.com)",
       "WebFetch(domain:learn.microsoft.com)",
-      "WebFetch(domain:www.better-auth.com)"
+      "WebFetch(domain:www.better-auth.com)",
+      "Bash(git checkout:*)"
     ],
     "deny": []
   }
