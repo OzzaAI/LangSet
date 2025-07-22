@@ -85,8 +85,10 @@ export async function GET(request: NextRequest) {
 
     const datasetIds = userDatasets.map(d => d.id);
 
-    // Get instances from user's datasets
-    const instances = await db
+    // Get instances from user's datasets with quality scoring
+    const { calculateQualityScore } = await import("@/lib/quality-scoring");
+    
+    let instancesData = await db
       .select()
       .from(instance)
       .where(and(
@@ -95,9 +97,46 @@ export async function GET(request: NextRequest) {
       .orderBy(desc(instance.updatedAt))
       .limit(50);
 
+    // Calculate quality scores and add suggestions for refinement
+    const instances = instancesData.map(inst => {
+      const qualityMetrics = calculateQualityScore(
+        inst.question, 
+        inst.answer, 
+        inst.tags as string[] || []
+      );
+
+      return {
+        ...inst,
+        qualityScore: qualityMetrics.score,
+        suggestions: qualityMetrics.suggestions,
+        breakdown: qualityMetrics.breakdown
+      };
+    });
+
+    // Calculate refinement stats
+    const totalInstances = instances.length;
+    const avgQualityScore = totalInstances > 0 
+      ? Math.round(instances.reduce((sum, inst) => sum + (inst.qualityScore || 0), 0) / totalInstances)
+      : 0;
+    
+    const lowQualityCount = instances.filter(inst => (inst.qualityScore || 0) < 60).length;
+    const improvementPotential = totalInstances > 0 
+      ? Math.round((lowQualityCount / totalInstances) * 30) // Max 30% improvement potential
+      : 0;
+    
+    const completedRefinements = instances.filter(inst => (inst.editCount || 0) > 0).length;
+
+    const stats = {
+      totalInstances,
+      avgQualityScore,
+      improvementPotential,
+      completedRefinements
+    };
+
     return NextResponse.json({
       success: true,
       instances,
+      stats,
       dailyEdits: {
         count: dailyEditsCount || 0,
         limit: 20,

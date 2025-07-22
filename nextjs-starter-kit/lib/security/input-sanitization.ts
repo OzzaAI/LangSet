@@ -4,43 +4,38 @@
  */
 
 import { z } from 'zod';
+import DOMPurify from 'dompurify';
+import { JSDOM } from 'jsdom';
 
-// HTML sanitization - remove dangerous tags and attributes
+// Initialize DOMPurify with JSDOM for server-side usage
+const window = new JSDOM('').window;
+const purify = DOMPurify(window as any);
+
+// Configure DOMPurify with safe defaults
+purify.addHook('beforeSanitizeElements', function (node, data) {
+  // Additional security hook - can add custom logic here
+});
+
+// HTML sanitization using DOMPurify - industry standard and secure
 export function sanitizeHTML(input: string): string {
   if (!input) return '';
   
-  // Remove script tags and javascript: protocols
-  let sanitized = input
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-    .replace(/javascript:/gi, '')
-    .replace(/on\w+\s*=/gi, ''); // Remove event handlers like onclick, onload
-  
-  // Remove dangerous HTML tags
-  const dangerousTags = [
-    'script', 'object', 'embed', 'form', 'input', 'button',
-    'frame', 'frameset', 'iframe', 'meta', 'link', 'style'
-  ];
-  
-  dangerousTags.forEach(tag => {
-    const regex = new RegExp(`<${tag}\\b[^>]*>.*?<\\/${tag}>`, 'gi');
-    sanitized = sanitized.replace(regex, '');
-    const selfClosing = new RegExp(`<${tag}\\b[^>]*\\/?>`, 'gi');
-    sanitized = sanitized.replace(selfClosing, '');
+  // Configure DOMPurify to allow only safe formatting tags
+  const cleanHTML = purify.sanitize(input, {
+    ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'code', 'pre', 'p', 'br', 'ul', 'ol', 'li'],
+    ALLOWED_ATTR: [], // No attributes allowed for maximum security
+    FORBID_TAGS: ['script', 'object', 'embed', 'form', 'input', 'button', 'iframe', 'style'],
+    FORBID_ATTR: ['onclick', 'onload', 'onerror', 'onmouseover', 'style'],
+    USE_PROFILES: { html: true },
+    RETURN_DOM: false,
+    RETURN_DOM_FRAGMENT: false,
+    RETURN_DOM_IMPORT: false,
+    SANITIZE_DOM: true,
+    KEEP_CONTENT: true,
+    IN_PLACE: false
   });
   
-  // Allow only safe formatting tags
-  const allowedTags = ['b', 'i', 'em', 'strong', 'code', 'pre', 'p', 'br'];
-  const tagPattern = /<(\/?)([\w-]+)([^>]*)>/g;
-  
-  sanitized = sanitized.replace(tagPattern, (match, closing, tagName, attributes) => {
-    if (allowedTags.includes(tagName.toLowerCase())) {
-      // Remove all attributes from allowed tags for safety
-      return `<${closing}${tagName}>`;
-    }
-    return ''; // Remove disallowed tags
-  });
-  
-  return sanitized.trim();
+  return cleanHTML.trim();
 }
 
 // SQL injection prevention patterns
@@ -58,30 +53,25 @@ export function validateSQLSafety(input: string): boolean {
   return !dangerousPatterns.some(pattern => pattern.test(input));
 }
 
-// XSS prevention for user content
+// XSS prevention for user content using DOMPurify
 export function sanitizeUserContent(content: string): string {
   if (!content) return '';
   
-  // First pass - HTML sanitization
-  let sanitized = sanitizeHTML(content);
-  
-  // Encode remaining special characters
-  const htmlEntities = {
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#x27;',
-    '/': '&#x2F;'
-  };
-  
-  // Only encode if not already part of allowed HTML tags
-  sanitized = sanitized.replace(/[&<>"'/]/g, (char) => {
-    // Don't encode if it's part of an allowed HTML tag
-    return htmlEntities[char as keyof typeof htmlEntities] || char;
+  // Use DOMPurify for comprehensive XSS prevention
+  const sanitized = purify.sanitize(content, {
+    ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'code', 'pre', 'p', 'br', 'ul', 'ol', 'li'],
+    ALLOWED_ATTR: [], // No attributes for maximum security
+    FORBID_TAGS: ['script', 'object', 'embed', 'form', 'input', 'button', 'iframe', 'style', 'link'],
+    FORBID_ATTR: ['onclick', 'onload', 'onerror', 'onmouseover', 'style', 'href', 'src'],
+    USE_PROFILES: { html: true },
+    KEEP_CONTENT: true,
+    SANITIZE_DOM: true,
+    SANITIZE_NAMED_PROPS: true,
+    SANITIZE_NAMED_PROPS_PREFIX: 'user-content',
+    RETURN_DOM: false
   });
   
-  return sanitized;
+  return sanitized.trim();
 }
 
 // Deep sanitization for nested objects

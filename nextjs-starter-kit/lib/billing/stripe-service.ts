@@ -3,6 +3,9 @@ import { db } from "@/db/drizzle";
 import { user, transaction } from "@/db/schema";
 import { eq } from "drizzle-orm";
 import { SUBSCRIPTION_TIERS, upgradeUserTier } from "./quota-service";
+import { StripeCircuitBreaker } from "@/lib/security/circuit-breaker";
+import { logger } from "@/lib/monitoring/error-logger";
+import { Errors } from "@/lib/monitoring/error-handler";
 
 // Initialize Stripe
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
@@ -36,12 +39,14 @@ export async function createStripeCustomer(
   name?: string
 ): Promise<string> {
   try {
-    const customer = await stripe.customers.create({
-      email,
-      name: name || undefined,
-      metadata: {
-        langset_user_id: userId,
-      },
+    const customer = await StripeCircuitBreaker.execute(async () => {
+      return await stripe.customers.create({
+        email,
+        name: name || undefined,
+        metadata: {
+          langset_user_id: userId,
+        },
+      });
     });
 
     // Update user with Stripe customer ID
@@ -57,8 +62,17 @@ export async function createStripeCustomer(
     return customer.id;
 
   } catch (error) {
-    console.error('[Stripe] Failed to create customer:', error);
-    throw error;
+    await logger.error(
+      '[Stripe] Failed to create customer',
+      error instanceof Error ? error : new Error(String(error)),
+      {
+        component: 'stripe',
+        operation: 'create_customer',
+        userId,
+        metadata: { email, name }
+      }
+    );
+    throw Errors.externalService('Stripe', error instanceof Error ? error : undefined);
   }
 }
 
@@ -116,7 +130,9 @@ export async function createSubscription(
       subscriptionData.default_payment_method = paymentMethodId;
     }
 
-    const subscription = await stripe.subscriptions.create(subscriptionData);
+    const subscription = await StripeCircuitBreaker.execute(async () => {
+      return await stripe.subscriptions.create(subscriptionData);
+    });
 
     console.log(`[Stripe] Created subscription ${subscription.id} for user ${userId}`);
 
@@ -166,17 +182,19 @@ export async function createPaymentIntent(
       customerId = await createStripeCustomer(userId, userData[0].email, userData[0].name);
     }
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(amount * 100), // Convert to cents
-      currency,
-      customer: customerId,
-      automatic_payment_methods: {
-        enabled: true,
-      },
-      metadata: {
-        langset_user_id: userId,
-        ...metadata
-      },
+    const paymentIntent = await StripeCircuitBreaker.execute(async () => {
+      return await stripe.paymentIntents.create({
+        amount: Math.round(amount * 100), // Convert to cents
+        currency,
+        customer: customerId,
+        automatic_payment_methods: {
+          enabled: true,
+        },
+        metadata: {
+          langset_user_id: userId,
+          ...metadata
+        },
+      });
     });
 
     return {
@@ -194,7 +212,186 @@ export async function createPaymentIntent(
 }
 
 /**
- * Process seller payout
+ * Create marketplace payment with Stripe Connect
+ */
+export async function createMarketplacePayment({
+  buyerId,
+  sellerId,
+  amount,
+  currency = 'usd',
+  platformFee,
+  metadata = {}
+}: {
+  buyerId: string;
+  sellerId: string;
+  amount: number;
+  currency?: string;
+  platformFee: number;
+  metadata?: Record<string, string>;
+}): Promise<StripePaymentIntent> {
+  try {
+    // Get buyer's Stripe customer
+    const buyerData = await db
+      .select({
+        stripeCustomerId: user.stripeCustomerId,
+        email: user.email,
+        name: user.name
+      })
+      .from(user)
+      .where(eq(user.id, buyerId))
+      .limit(1);
+
+    if (!buyerData[0]) {
+      throw new Error("Buyer not found");
+    }
+
+    let customerIdBuyer = buyerData[0].stripeCustomerId;
+    
+    if (!customerIdBuyer) {
+      customerIdBuyer = await createStripeCustomer(buyerId, buyerData[0].email, buyerData[0].name);
+    }
+
+    // Get seller's Stripe Connect account
+    const sellerData = await db
+      .select({
+        stripeConnectAccountId: user.stripeConnectAccountId,
+        email: user.email
+      })
+      .from(user)
+      .where(eq(user.id, sellerId))
+      .limit(1);
+
+    if (!sellerData[0]) {
+      throw new Error("Seller not found");
+    }
+
+    // If seller doesn't have Connect account, create one
+    let connectAccountId = sellerData[0].stripeConnectAccountId;
+    if (!connectAccountId) {
+      connectAccountId = await createConnectAccount(sellerId, sellerData[0].email);
+    }
+
+    const sellerAmount = amount - platformFee;
+
+    // Create payment intent with application fee
+    const paymentIntent = await StripeCircuitBreaker.execute(async () => {
+      return await stripe.paymentIntents.create({
+        amount: Math.round(amount * 100), // Convert to cents
+        currency,
+        customer: customerIdBuyer,
+        application_fee_amount: Math.round(platformFee * 100), // Platform fee in cents
+        transfer_data: {
+          destination: connectAccountId,
+        },
+        automatic_payment_methods: {
+          enabled: true,
+        },
+        metadata: {
+          langset_buyer_id: buyerId,
+          langset_seller_id: sellerId,
+          seller_amount: sellerAmount.toString(),
+          platform_fee: platformFee.toString(),
+          ...metadata
+        },
+      });
+    });
+
+    console.log(`[Stripe] Created marketplace payment intent ${paymentIntent.id} for $${amount}`);
+    console.log(`[Stripe] Platform fee: $${platformFee}, Seller receives: $${sellerAmount}`);
+
+    return {
+      id: paymentIntent.id,
+      clientSecret: paymentIntent.client_secret!,
+      amount: paymentIntent.amount,
+      currency: paymentIntent.currency,
+      status: paymentIntent.status
+    };
+
+  } catch (error) {
+    console.error('[Stripe] Failed to create marketplace payment:', error);
+    throw error;
+  }
+}
+
+/**
+ * Create Stripe Connect account for seller
+ */
+export async function createConnectAccount(
+  sellerId: string,
+  email: string
+): Promise<string> {
+  try {
+    const account = await StripeCircuitBreaker.execute(async () => {
+      return await stripe.accounts.create({
+        type: 'express',
+        country: 'US', // Default to US, should be configurable
+        email: email,
+        metadata: {
+          langset_seller_id: sellerId
+        },
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true }
+        }
+      });
+    });
+
+    // Update user with Connect account ID
+    await db
+      .update(user)
+      .set({
+        stripeConnectAccountId: account.id,
+        updatedAt: new Date()
+      })
+      .where(eq(user.id, sellerId));
+
+    console.log(`[Stripe] Created Connect account ${account.id} for seller ${sellerId}`);
+    return account.id;
+
+  } catch (error) {
+    console.error('[Stripe] Failed to create Connect account:', error);
+    throw error;
+  }
+}
+
+/**
+ * Create Connect onboarding link for seller
+ */
+export async function createConnectOnboardingLink(
+  sellerId: string,
+  refreshUrl: string,
+  returnUrl: string
+): Promise<string> {
+  try {
+    const userData = await db
+      .select({
+        stripeConnectAccountId: user.stripeConnectAccountId
+      })
+      .from(user)
+      .where(eq(user.id, sellerId))
+      .limit(1);
+
+    if (!userData[0]?.stripeConnectAccountId) {
+      throw new Error("Seller must have a Connect account first");
+    }
+
+    const accountLink = await stripe.accountLinks.create({
+      account: userData[0].stripeConnectAccountId,
+      refresh_url: refreshUrl,
+      return_url: returnUrl,
+      type: 'account_onboarding'
+    });
+
+    return accountLink.url;
+
+  } catch (error) {
+    console.error('[Stripe] Failed to create onboarding link:', error);
+    throw error;
+  }
+}
+
+/**
+ * Process seller payout - now uses real Stripe Connect
  */
 export async function createSellerPayout(
   sellerId: string,
@@ -203,38 +400,32 @@ export async function createSellerPayout(
   description: string = "Dataset sale earnings"
 ): Promise<string> {
   try {
-    // In a real implementation, you'd need to set up Stripe Connect
-    // and create transfers to connected accounts
-    
-    // For MVP, we'll simulate the payout by updating the user's earnings
+    // Update seller's total earnings in database
+    const currentEarnings = await db
+      .select({ totalEarnings: user.totalEarnings })
+      .from(user)
+      .where(eq(user.id, sellerId))
+      .limit(1);
+
+    const newTotal = (currentEarnings[0]?.totalEarnings || 0) + amount;
+
     await db
       .update(user)
       .set({
-        totalEarnings: amount, // This should be += amount in real implementation
+        totalEarnings: newTotal,
         updatedAt: new Date()
       })
       .where(eq(user.id, sellerId));
 
-    // Record the payout transaction
-    await db.insert(transaction).values({
-      id: crypto.randomUUID(),
-      amount: Math.round(amount * 100), // Store in cents
-      currency: "USD",
-      status: "completed",
-      type: "payout",
-      stripePaymentIntentId: `payout_${crypto.randomUUID()}`,
-      buyerId: "system", // System payout
-      sellerId,
-      listingId: transactionId, // Reference to original transaction
-      createdAt: new Date(),
-      updatedAt: new Date()
-    });
-
-    console.log(`[Stripe] Processed payout of $${amount} to seller ${sellerId}`);
-    return `payout_${crypto.randomUUID()}`;
+    console.log(`[Stripe] Updated seller ${sellerId} earnings: +$${amount} (total: $${newTotal})`);
+    
+    // Note: Actual transfer to seller's bank account happens automatically 
+    // via Stripe Connect when payment is captured
+    
+    return `earnings_updated_${crypto.randomUUID()}`;
 
   } catch (error) {
-    console.error('[Stripe] Failed to process payout:', error);
+    console.error('[Stripe] Failed to process seller payout:', error);
     throw error;
   }
 }
@@ -276,11 +467,29 @@ export async function handleStripeWebhook(
 
       case 'payment_intent.succeeded': {
         const paymentIntent = event.data.object as Stripe.PaymentIntent;
-        const userId = paymentIntent.metadata.langset_user_id;
+        const buyerId = paymentIntent.metadata.langset_buyer_id;
+        const sellerId = paymentIntent.metadata.langset_seller_id;
 
-        if (userId) {
+        if (buyerId && sellerId) {
+          console.log(`[Stripe Webhook] Marketplace payment succeeded: $${paymentIntent.amount / 100}`);
+          
+          // Update transaction status
+          await db
+            .update(transaction)
+            .set({
+              status: "completed",
+              updatedAt: new Date()
+            })
+            .where(eq(transaction.stripePaymentIntentId, paymentIntent.id));
+
+          // Process seller payout
+          const sellerAmount = parseFloat(paymentIntent.metadata.seller_amount);
+          await createSellerPayout(sellerId, sellerAmount, paymentIntent.id);
+          
+          console.log(`[Stripe Webhook] Processed payout to seller ${sellerId}: $${sellerAmount}`);
+        } else if (paymentIntent.metadata.langset_user_id) {
+          const userId = paymentIntent.metadata.langset_user_id;
           console.log(`[Stripe Webhook] Payment succeeded for user ${userId}: $${paymentIntent.amount / 100}`);
-          // Handle one-time payment success if needed
         }
         break;
       }
@@ -425,6 +634,9 @@ export default {
   createStripeCustomer,
   createSubscription,
   createPaymentIntent,
+  createMarketplacePayment,
+  createConnectAccount,
+  createConnectOnboardingLink,
   createSellerPayout,
   handleStripeWebhook,
   getUserSubscriptionStatus,

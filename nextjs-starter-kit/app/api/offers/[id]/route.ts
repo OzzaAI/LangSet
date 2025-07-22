@@ -95,55 +95,96 @@ export async function PUT(
       .where(eq(offer.id, offerId))
       .returning();
 
-    // If accepted, create a mock transaction record
+    // If accepted, create real Stripe payment intent
     if (action === "accept") {
-      const platformFee = calculatePlatformFee(offerRecord.amount);
-      const sellerAmount = calculateSellerAmount(offerRecord.amount);
+      const { createMarketplacePayment } = await import("@/lib/billing/stripe-service");
+      
+      try {
+        const platformFee = calculatePlatformFee(offerRecord.amount);
+        const sellerAmount = calculateSellerAmount(offerRecord.amount);
 
-      const transactionRecord = {
-        id: nanoid(),
-        amount: offerRecord.amount,
-        platformFee,
-        sellerAmount,
-        currency: offerRecord.currency,
-        status: "pending" as const, // Would be "completed" after Stripe processing
-        stripePaymentIntentId: null, // Would be populated by Stripe
-        buyerId: offerRecord.buyerId,
-        sellerId: session.user.id,
-        listingId: offerRecord.listingId,
-        offerId: offerId,
-      };
-
-      await db.insert(transaction).values(transactionRecord);
-
-      // Log successful offer acceptance
-      if (typeof window !== "undefined" && window.posthog) {
-        window.posthog.capture("offer_accepted", {
-          offer_id: offerId,
-          listing_id: offerRecord.listingId,
+        // Create Stripe payment intent with platform fee handling
+        const paymentIntent = await createMarketplacePayment({
+          buyerId: offerRecord.buyerId,
+          sellerId: session.user.id,
           amount: offerRecord.amount,
-          platform_fee: platformFee,
-          seller_amount: sellerAmount,
-          timestamp: new Date().toISOString(),
+          currency: offerRecord.currency,
+          platformFee,
+          metadata: {
+            offer_id: offerId,
+            listing_id: offerRecord.listingId,
+            transaction_type: "dataset_purchase"
+          }
         });
+
+        const transactionRecord = {
+          id: nanoid(),
+          amount: offerRecord.amount,
+          platformFee,
+          sellerAmount,
+          currency: offerRecord.currency,
+          status: "pending" as const,
+          stripePaymentIntentId: paymentIntent.id,
+          buyerId: offerRecord.buyerId,
+          sellerId: session.user.id,
+          listingId: offerRecord.listingId,
+          offerId: offerId,
+        };
+
+        await db.insert(transaction).values(transactionRecord);
+
+        // Log successful offer acceptance
+        if (typeof window !== "undefined" && window.posthog) {
+          window.posthog.capture("offer_accepted", {
+            offer_id: offerId,
+            listing_id: offerRecord.listingId,
+            amount: offerRecord.amount,
+            platform_fee: platformFee,
+            seller_amount: sellerAmount,
+            payment_intent_id: paymentIntent.id,
+            timestamp: new Date().toISOString(),
+          });
+        }
+
+        console.log("Stripe Payment Created:", {
+          payment_intent_id: paymentIntent.id,
+          amount: offerRecord.amount,
+          currency: offerRecord.currency,
+          buyer_id: offerRecord.buyerId,
+          seller_id: session.user.id,
+          platform_fee: platformFee,
+          seller_receives: sellerAmount,
+        });
+
+        // Return payment details for buyer checkout
+        return NextResponse.json({
+          success: true,
+          message: "Offer accepted successfully",
+          offer: updatedOffer[0],
+          payment: {
+            client_secret: paymentIntent.clientSecret,
+            amount: offerRecord.amount,
+            currency: offerRecord.currency
+          }
+        });
+
+      } catch (paymentError) {
+        console.error("Failed to create payment intent:", paymentError);
+        
+        // Revert offer status if payment creation fails
+        await db
+          .update(offer)
+          .set({
+            status: "pending",
+            updatedAt: new Date(),
+          })
+          .where(eq(offer.id, offerId));
+
+        return NextResponse.json(
+          { error: "Failed to process payment. Please try again." },
+          { status: 500 }
+        );
       }
-
-      // In a real implementation, you would:
-      // 1. Create Stripe payment intent
-      // 2. Send payment link to buyer
-      // 3. Handle payment confirmation webhook
-      // 4. Transfer funds to seller (minus platform fee)
-      // 5. Grant buyer access to dataset
-
-      console.log("Mock Stripe Integration:", {
-        action: "create_payment_intent",
-        amount: offerRecord.amount,
-        currency: offerRecord.currency,
-        buyer_id: offerRecord.buyerId,
-        seller_id: session.user.id,
-        platform_fee: platformFee,
-        seller_receives: sellerAmount,
-      });
     }
 
     // Log offer response event

@@ -31,6 +31,7 @@ export const user = pgTable("user", {
   lastContextUpdate: timestamp("last_context_update"),
   subscriptionTier: text("subscription_tier").default("basic"),
   stripeCustomerId: text("stripe_customer_id"),
+  stripeConnectAccountId: text("stripe_connect_account_id"),
   instanceQuotaDaily: integer("instance_quota_daily").default(20),
   instanceQuotaUsed: integer("instance_quota_used").default(0),
   qualityMultiplier: real("quality_multiplier").default(1.0),
